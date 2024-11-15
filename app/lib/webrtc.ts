@@ -14,6 +14,7 @@ const config = {
     },
   ],
   iceCandidatePoolSize: 10,
+  iceTransportPolicy: 'all',
 }
 
 interface SetupOptions {
@@ -27,14 +28,75 @@ export async function setupWebRTC(
 ): Promise<WebRTCConnection> {
   const { onRemoteStream, onLog } = options
   const peerConnection = new RTCPeerConnection(config)
-  const signalingSocket = new WebSocket('wss://another-one-6vdy.onrender.com')
+  
+  // Use environment variable for WebSocket URL
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080'
+  const signalingSocket = new WebSocket(wsUrl)
 
+  let reconnectAttempts = 0
+  const maxReconnectAttempts = 5
+  const reconnectDelay = 2000 // 2 seconds
+
+  function setupWebSocketHandlers() {
+    signalingSocket.onopen = () => {
+      onLog('WebSocket connection established')
+      reconnectAttempts = 0
+      createAndSendOffer()
+    }
+
+    signalingSocket.onclose = () => {
+      onLog('WebSocket connection closed')
+      if (reconnectAttempts < maxReconnectAttempts) {
+        setTimeout(() => {
+          reconnectAttempts++
+          onLog(`Attempting to reconnect (${reconnectAttempts}/${maxReconnectAttempts})...`)
+          signalingSocket.close()
+          setupWebSocketConnection()
+        }, reconnectDelay)
+      }
+    }
+
+    signalingSocket.onerror = (error) => {
+      onLog(`WebSocket error: ${error}`)
+    }
+
+    signalingSocket.onmessage = async (event) => {
+      let messageData: string
+      
+      try {
+        messageData = event.data instanceof Blob ? await event.data.text() : event.data
+        const data = JSON.parse(messageData)
+        
+        switch (data.type) {
+          case 'offer':
+            handleOffer(data.offer)
+            break
+          case 'answer':
+            handleAnswer(data.answer)
+            break
+          case 'ice-candidate':
+            handleIceCandidate(data.candidate)
+            break
+          default:
+            onLog(`Unknown message type: ${data.type}`)
+        }
+      } catch (err) {
+        onLog(`Error processing message: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+  }
+
+  function setupWebSocketConnection() {
+    setupWebSocketHandlers()
+  }
+
+  // Set up WebRTC handlers
   localStream.getTracks().forEach((track) => {
     peerConnection.addTrack(track, localStream)
   })
 
   peerConnection.onicecandidate = (event) => {
-    if (event.candidate) {
+    if (event.candidate && signalingSocket.readyState === WebSocket.OPEN) {
       signalingSocket.send(
         JSON.stringify({
           type: 'ice-candidate',
@@ -60,47 +122,24 @@ export async function setupWebRTC(
     }
   }
 
-  signalingSocket.onopen = () => {
-    onLog('WebSocket connection established')
-    createAndSendOffer()
-  }
-
-  signalingSocket.onmessage = async (event) => {
-    let messageData: string
-    
-    try {
-      messageData = event.data instanceof Blob ? await event.data.text() : event.data
-      const data = JSON.parse(messageData)
-      
-      switch (data.type) {
-        case 'offer':
-          handleOffer(data.offer)
-          break
-        case 'answer':
-          handleAnswer(data.answer)
-          break
-        case 'ice-candidate':
-          handleIceCandidate(data.candidate)
-          break
-        default:
-          onLog(`Unknown message type: ${data.type}`)
-      }
-    } catch (err) {
-      onLog(`Error processing message: ${err instanceof Error ? err.message : String(err)}`)
-    }
-  }
+  // Initial WebSocket setup
+  setupWebSocketConnection()
 
   async function createAndSendOffer() {
     try {
       const offer = await peerConnection.createOffer()
       await peerConnection.setLocalDescription(offer)
-      signalingSocket.send(
-        JSON.stringify({
-          type: 'offer',
-          offer: peerConnection.localDescription,
-        })
-      )
-      onLog('Offer sent')
+      if (signalingSocket.readyState === WebSocket.OPEN) {
+        signalingSocket.send(
+          JSON.stringify({
+            type: 'offer',
+            offer: peerConnection.localDescription,
+          })
+        )
+        onLog('Offer sent')
+      } else {
+        onLog('WebSocket not ready, could not send offer')
+      }
     } catch (err) {
       onLog(`Failed to create and send offer: ${err instanceof Error ? err.message : String(err)}`)
     }
@@ -111,13 +150,17 @@ export async function setupWebRTC(
       await peerConnection.setRemoteDescription(new RTCSessionDescription(offer))
       const answer = await peerConnection.createAnswer()
       await peerConnection.setLocalDescription(answer)
-      signalingSocket.send(
-        JSON.stringify({
-          type: 'answer',
-          answer: peerConnection.localDescription,
-        })
-      )
-      onLog('Answer sent')
+      if (signalingSocket.readyState === WebSocket.OPEN) {
+        signalingSocket.send(
+          JSON.stringify({
+            type: 'answer',
+            answer: peerConnection.localDescription,
+          })
+        )
+        onLog('Answer sent')
+      } else {
+        onLog('WebSocket not ready, could not send answer')
+      }
     } catch (err) {
       onLog(`Failed to handle offer: ${err instanceof Error ? err.message : String(err)}`)
     }
@@ -137,7 +180,11 @@ export async function setupWebRTC(
       await peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
       onLog('ICE candidate added')
     } catch (err) {
-      onLog(`Failed to add ICE candidate: ${err instanceof Error ? err.message : String(err)}`)
+      if (err instanceof Error && err.message.includes('Unknown ufrag')) {
+        onLog(`Ignoring ICE candidate with unknown ufrag: ${err.message}`)
+      } else {
+        onLog(`Failed to add ICE candidate: ${err instanceof Error ? err.message : String(err)}`)
+      }
     }
   }
 
